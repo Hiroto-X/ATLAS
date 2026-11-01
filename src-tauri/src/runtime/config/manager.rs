@@ -1,30 +1,24 @@
 use std::{
-    fs,
-    io,
+    fs, io,
     path::{Path, PathBuf},
 };
 
-
 use super::schema::RuntimeConfig;
 
-
+#[derive(Clone)]
 pub struct ConfigManager {
     config_path: PathBuf,
 }
 
 impl ConfigManager {
     pub fn new(app_name: &str) -> io::Result<Self> {
-        let base_dir = directories::ProjectDirs::from(
-            "com",
-            "atlas",
-            app_name,
-        )
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                "Unable to locate application configuration directory",
-            )
-        })?;
+        let base_dir =
+            directories::ProjectDirs::from("com", "atlas", app_name).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "Unable to locate application configuration directory",
+                )
+            })?;
 
         let config_dir = base_dir.config_dir();
 
@@ -44,9 +38,8 @@ impl ConfigManager {
 
         let contents = fs::read_to_string(&self.config_path)?;
 
-        serde_json::from_str(&contents).map_err(|error| {
-            io::Error::new(io::ErrorKind::InvalidData, error)
-        })
+        serde_json::from_str(&contents)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
     }
 
     pub fn save(&self, config: &RuntimeConfig) -> io::Result<()> {
@@ -62,14 +55,14 @@ impl ConfigManager {
     #[cfg(test)]
     pub(crate) fn new_for_test(config_path: PathBuf) -> Self {
         Self { config_path }
-}
+    }
 }
 
 fn atomic_write(path: &Path, contents: &[u8]) -> io::Result<()> {
     let temp_path = path.with_extension("json.tmp");
 
     fs::write(&temp_path, contents)?;
-    
+
     if let Err(error) = fs::rename(&temp_path, path) {
         let _ = fs::remove_file(&temp_path);
         return Err(error);
@@ -117,21 +110,17 @@ mod tests {
             permission_states: BTreeMap::new(),
         };
 
-        config.permission_states.insert(
-            Permission::HardwareMetadata,
-            PermissionState::Granted,
-        );
-        
-        config.permission_states.insert(
-            Permission::NetworkMetadata,
-            PermissionState::Denied,
-        );
+        config
+            .permission_states
+            .insert(Permission::HardwareMetadata, PermissionState::Granted);
+
+        config
+            .permission_states
+            .insert(Permission::NetworkMetadata, PermissionState::Denied);
         manager.save(&config).unwrap();
 
         let loaded = manager.load().unwrap();
 
-        
-        
         assert_eq!(
             loaded.permission_states.get(&Permission::HardwareMetadata),
             Some(&PermissionState::Granted)
