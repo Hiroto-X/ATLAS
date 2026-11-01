@@ -294,7 +294,7 @@ The structure will evolve as additional engines are implemented.
 Clone the repository:
 
 ```bash
-git clone <repository-url>
+git clone <https://github.com/Hiroto-X/ATLAS>
 cd ATLAS
 ```
 
