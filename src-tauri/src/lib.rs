@@ -35,38 +35,35 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-use super::*;
+    use super::*;
 
+    #[test]
+    fn system_info_returns_valid_os() {
+        let info = get_system_info();
 
-#[test]
-fn system_info_returns_valid_os() {
-    let info = get_system_info();
+        assert!(!info.os.is_empty());
+    }
 
-    assert!(!info.os.is_empty());
-}
+    #[test]
+    fn system_info_returns_valid_architecture() {
+        let info = get_system_info();
 
-#[test]
-fn system_info_returns_valid_architecture() {
-    let info = get_system_info();
+        assert!(!info.architecture.is_empty());
+    }
 
-    assert!(!info.architecture.is_empty());
-}
+    #[test]
+    fn system_info_returns_valid_hostname() {
+        let info = get_system_info();
 
-#[test]
-fn system_info_returns_valid_hostname() {
-    let info = get_system_info();
+        assert!(!info.hostname.is_empty());
+        assert_ne!(info.hostname, "Unknown device");
+    }
 
-    assert!(!info.hostname.is_empty());
-    assert_ne!(info.hostname, "Unknown device");
-}
+    #[test]
+    fn system_info_returns_app_version() {
+        let info = get_system_info();
 
-#[test]
-fn system_info_returns_app_version() {
-    let info = get_system_info();
-
-    assert!(!info.app_version.is_empty());
-    assert_eq!(info.app_version, env!("CARGO_PKG_VERSION"));
-}
-
-
+        assert!(!info.app_version.is_empty());
+        assert_eq!(info.app_version, env!("CARGO_PKG_VERSION"));
+    }
 }

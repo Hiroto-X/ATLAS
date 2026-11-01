@@ -53,9 +53,7 @@ impl LifecycleManager {
     }
 
     pub fn begin_shutdown(&mut self) -> Result<(), RuntimeError> {
-        if self.status != RuntimeStatus::Running
-            && self.status != RuntimeStatus::Paused
-        {
+        if self.status != RuntimeStatus::Running && self.status != RuntimeStatus::Paused {
             return Err(RuntimeError::InvalidState(
                 "Runtime cannot begin shutdown from its current state".into(),
             ));
