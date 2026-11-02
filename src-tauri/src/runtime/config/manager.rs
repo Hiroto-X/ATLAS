@@ -3,6 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use super::atomic::atomic_write;
 use super::migration::migrate_legacy_config;
 use super::schema::RuntimeConfig;
 
@@ -75,19 +76,6 @@ impl ConfigManager {
     pub(crate) fn new_for_test(config_path: PathBuf) -> Self {
         Self { config_path }
     }
-}
-
-fn atomic_write(path: &Path, contents: &[u8]) -> io::Result<()> {
-    let temp_path = path.with_extension("json.tmp");
-
-    fs::write(&temp_path, contents)?;
-
-    if let Err(error) = fs::rename(&temp_path, path) {
-        let _ = fs::remove_file(&temp_path);
-        return Err(error);
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]
