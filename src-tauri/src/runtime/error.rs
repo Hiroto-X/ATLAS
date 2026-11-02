@@ -6,6 +6,9 @@ pub enum RuntimeError {
     InitializationFailed(String),
     ShutdownFailed(String),
     ConfigurationFailed(String),
+    /// A permission was restricted (denied or revoked) in memory, but the
+    /// change could not be saved. The restriction is still in effect.
+    PermissionNotPersisted(String),
 }
 
 impl fmt::Display for RuntimeError {
@@ -26,8 +29,43 @@ impl fmt::Display for RuntimeError {
             RuntimeError::ConfigurationFailed(message) => {
                 write!(f, "Runtime configuration failed: {message}")
             }
+
+            RuntimeError::PermissionNotPersisted(message) => {
+                write!(f, "Permission change not persisted: {message}")
+            }
         }
     }
 }
 
 impl std::error::Error for RuntimeError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn permission_not_persisted_has_its_own_message() {
+        let error = RuntimeError::PermissionNotPersisted("disk full".into());
+
+        assert_eq!(
+            error.to_string(),
+            "Permission change not persisted: disk full"
+        );
+    }
+
+    #[test]
+    fn permission_not_persisted_is_distinct_from_configuration_failed() {
+        let not_persisted = RuntimeError::PermissionNotPersisted("x".into());
+        let failed = RuntimeError::ConfigurationFailed("x".into());
+
+        assert!(matches!(
+            not_persisted,
+            RuntimeError::PermissionNotPersisted(_)
+        ));
+        assert!(!matches!(
+            not_persisted,
+            RuntimeError::ConfigurationFailed(_)
+        ));
+        assert_ne!(not_persisted.to_string(), failed.to_string());
+    }
+}

@@ -61,16 +61,18 @@ impl RuntimeHost {
 
     /// Grants a permission and saves the decision to `runtime.json`.
     ///
-    /// If the decision cannot be saved, an error is returned and the
-    /// permission is left unchanged.
+    /// The decision is saved first and only applied in memory once the save
+    /// succeeds. If it cannot be saved, `ConfigurationFailed` is returned and
+    /// the permission is left unchanged.
     pub fn grant_permission(&mut self, permission: Permission) -> Result<(), RuntimeError> {
         self.persist_permission_state(permission, PermissionState::Granted)
     }
 
     /// Denies a permission and saves the decision to `runtime.json`.
     ///
-    /// If the decision cannot be saved, an error is returned and the
-    /// permission is left unchanged.
+    /// The denial takes effect in memory immediately and is saved afterwards.
+    /// If it cannot be saved, `PermissionNotPersisted` is returned and the
+    /// permission stays denied in memory.
     pub fn deny_permission(&mut self, permission: Permission) -> Result<(), RuntimeError> {
         self.persist_permission_state(permission, PermissionState::Denied)
     }
@@ -78,8 +80,9 @@ impl RuntimeHost {
     /// Resets a permission to `NotRequested` and saves the change to
     /// `runtime.json`.
     ///
-    /// If the change cannot be saved, an error is returned and the previous
-    /// decision is left in place.
+    /// Authorization is removed in memory immediately and the change is saved
+    /// afterwards. If it cannot be saved, `PermissionNotPersisted` is returned
+    /// and the permission stays revoked in memory.
     pub fn revoke_permission(&mut self, permission: Permission) -> Result<(), RuntimeError> {
         self.persist_permission_state(permission, PermissionState::NotRequested)
     }
@@ -88,11 +91,22 @@ impl RuntimeHost {
         self.permissions.is_granted(permission)
     }
 
-    /// Saves a permission decision, then applies it in memory.
+    /// Applies a permission decision and saves it to `runtime.json`.
     ///
-    /// The change is written to a copy of the configuration first. In-memory
-    /// state is only updated once the save succeeds, so a permission can never
-    /// be active in memory without having been persisted.
+    /// The order depends on the direction of the change:
+    ///
+    /// * `Granted` is saved first and only applied in memory once the save
+    ///   succeeds, so a permission is never active without having been
+    ///   persisted. A failed save returns `ConfigurationFailed` and changes
+    ///   nothing.
+    /// * `Denied` and `NotRequested` (revoke) remove authorization, so they
+    ///   are applied in memory first and saved afterwards. A failed save
+    ///   returns `PermissionNotPersisted` and the restriction stays in effect.
+    ///
+    /// The permission manager and `self.config` are always updated together,
+    /// so they stay consistent. Every save writes the full configuration, so a
+    /// restriction that could not be saved is written by the next successful
+    /// save of any permission.
     fn persist_permission_state(
         &mut self,
         permission: Permission,
@@ -110,21 +124,34 @@ impl RuntimeHost {
             }
         }
 
-        self.config_manager.save(&updated_config).map_err(|error| {
-            RuntimeError::ConfigurationFailed(format!(
-                "failed to persist {permission:?} permission change: {error}"
-            ))
-        })?;
+        if state == PermissionState::Granted {
+            self.config_manager.save(&updated_config).map_err(|error| {
+                RuntimeError::ConfigurationFailed(format!(
+                    "failed to persist {permission:?} permission change: {error}"
+                ))
+            })?;
 
-        match state {
-            PermissionState::Granted => self.permissions.grant(permission),
-            PermissionState::Denied => self.permissions.deny(permission),
-            PermissionState::NotRequested => self.permissions.revoke(permission),
+            self.permissions.grant(permission);
+            self.config = updated_config;
+
+            return Ok(());
+        }
+
+        // Denying or revoking removes authorization, so it takes effect before
+        // the save is attempted and is kept even if the save fails.
+        if state == PermissionState::Denied {
+            self.permissions.deny(permission);
+        } else {
+            self.permissions.revoke(permission);
         }
 
         self.config = updated_config;
 
-        Ok(())
+        self.config_manager.save(&self.config).map_err(|error| {
+            RuntimeError::PermissionNotPersisted(format!(
+                "{permission:?} was set to {state:?} in memory, but saving it failed: {error}"
+            ))
+        })
     }
 }
 
@@ -167,6 +194,36 @@ mod tests {
 
     fn remove_storage(manager: &ConfigManager) {
         fs::remove_dir_all(manager.path().parent().unwrap()).unwrap();
+    }
+
+    fn restore_storage(manager: &ConfigManager) {
+        fs::create_dir(manager.path().parent().unwrap()).unwrap();
+    }
+
+    const ALL_PERMISSIONS: [Permission; 5] = [
+        Permission::HardwareMetadata,
+        Permission::ProcessMetadata,
+        Permission::SoftwareInventory,
+        Permission::FilesystemMetadata,
+        Permission::NetworkMetadata,
+    ];
+
+    /// The permission manager and the configuration mirror must never disagree.
+    fn assert_memory_and_config_agree(host: &RuntimeHost) {
+        for permission in ALL_PERMISSIONS {
+            let mirrored = host
+                .config()
+                .permission_states
+                .get(&permission)
+                .copied()
+                .unwrap_or(PermissionState::NotRequested);
+
+            assert_eq!(
+                host.permission_state(permission),
+                mirrored,
+                "{permission:?}"
+            );
+        }
     }
 
     #[test]
@@ -473,42 +530,238 @@ mod tests {
     }
 
     #[test]
-    fn deny_failure_leaves_previous_decision_unchanged() {
+    fn deny_failure_keeps_denied_in_memory_and_reports_not_persisted() {
         let (_directory, manager, mut host) = create_host_with_removable_storage();
 
         host.grant_permission(Permission::ProcessMetadata).unwrap();
         remove_storage(&manager);
 
-        let result = host.deny_permission(Permission::ProcessMetadata);
+        let error = host
+            .deny_permission(Permission::ProcessMetadata)
+            .unwrap_err();
 
-        assert!(matches!(result, Err(RuntimeError::ConfigurationFailed(_))));
+        assert!(matches!(error, RuntimeError::PermissionNotPersisted(_)));
+        assert!(error.to_string().contains("not persisted"));
+        assert!(error.to_string().contains("ProcessMetadata"));
+        assert!(!host.is_authorized(Permission::ProcessMetadata));
         assert_eq!(
             host.permission_state(Permission::ProcessMetadata),
-            PermissionState::Granted
+            PermissionState::Denied
         );
         assert_eq!(
             host.config()
                 .permission_states
                 .get(&Permission::ProcessMetadata),
-            Some(&PermissionState::Granted)
+            Some(&PermissionState::Denied)
         );
+        assert_memory_and_config_agree(&host);
     }
 
     #[test]
-    fn revoke_failure_leaves_permission_granted() {
+    fn revoke_failure_keeps_revoked_state_in_memory_and_reports_not_persisted() {
         let (_directory, manager, mut host) = create_host_with_removable_storage();
 
         host.grant_permission(Permission::NetworkMetadata).unwrap();
         remove_storage(&manager);
 
-        let result = host.revoke_permission(Permission::NetworkMetadata);
+        let error = host
+            .revoke_permission(Permission::NetworkMetadata)
+            .unwrap_err();
 
-        assert!(matches!(result, Err(RuntimeError::ConfigurationFailed(_))));
-        assert!(host.is_authorized(Permission::NetworkMetadata));
+        assert!(matches!(error, RuntimeError::PermissionNotPersisted(_)));
+        assert!(error.to_string().contains("not persisted"));
+        assert!(error.to_string().contains("NetworkMetadata"));
+        assert!(!host.is_authorized(Permission::NetworkMetadata));
         assert_eq!(
             host.permission_state(Permission::NetworkMetadata),
-            PermissionState::Granted
+            PermissionState::NotRequested
         );
+        assert!(host
+            .config()
+            .permission_states
+            .get(&Permission::NetworkMetadata)
+            .is_none());
+        assert_memory_and_config_agree(&host);
+    }
+
+    #[test]
+    fn deny_failure_on_a_never_granted_permission_still_records_denied() {
+        let (_directory, manager, mut host) = create_host_with_removable_storage();
+        remove_storage(&manager);
+
+        let result = host.deny_permission(Permission::ProcessMetadata);
+
+        assert!(matches!(
+            result,
+            Err(RuntimeError::PermissionNotPersisted(_))
+        ));
+        assert!(!host.is_authorized(Permission::ProcessMetadata));
+        assert_eq!(
+            host.permission_state(Permission::ProcessMetadata),
+            PermissionState::Denied
+        );
+        assert_memory_and_config_agree(&host);
+    }
+
+    #[test]
+    fn unsaved_deny_is_persisted_by_a_later_successful_save() {
+        let (_directory, manager, mut host) = create_host_with_removable_storage();
+
+        host.grant_permission(Permission::HardwareMetadata).unwrap();
+        remove_storage(&manager);
+
+        assert!(host.deny_permission(Permission::HardwareMetadata).is_err());
+
+        restore_storage(&manager);
+        host.grant_permission(Permission::NetworkMetadata).unwrap();
+
+        let saved = manager.load().unwrap();
+
+        assert_eq!(
+            saved.permission_states.get(&Permission::HardwareMetadata),
+            Some(&PermissionState::Denied)
+        );
+        assert_eq!(
+            saved.permission_states.get(&Permission::NetworkMetadata),
+            Some(&PermissionState::Granted)
+        );
+        assert_memory_and_config_agree(&host);
+        drop(host);
+
+        let restored = RuntimeHost::new(&manager).unwrap();
+
+        assert_eq!(
+            restored.permission_state(Permission::HardwareMetadata),
+            PermissionState::Denied
+        );
+        assert!(!restored.is_authorized(Permission::HardwareMetadata));
+        assert!(restored.is_authorized(Permission::NetworkMetadata));
+    }
+
+    #[test]
+    fn unsaved_revoke_is_persisted_by_a_later_successful_save() {
+        let (_directory, manager, mut host) = create_host_with_removable_storage();
+
+        host.grant_permission(Permission::HardwareMetadata).unwrap();
+        remove_storage(&manager);
+
+        assert!(host
+            .revoke_permission(Permission::HardwareMetadata)
+            .is_err());
+
+        restore_storage(&manager);
+        host.deny_permission(Permission::NetworkMetadata).unwrap();
+
+        let saved = manager.load().unwrap();
+
+        assert!(saved
+            .permission_states
+            .get(&Permission::HardwareMetadata)
+            .is_none());
+        assert_eq!(
+            saved.permission_states.get(&Permission::NetworkMetadata),
+            Some(&PermissionState::Denied)
+        );
+        assert_memory_and_config_agree(&host);
+        drop(host);
+
+        let restored = RuntimeHost::new(&manager).unwrap();
+
+        assert!(!restored.is_authorized(Permission::HardwareMetadata));
+        assert_eq!(
+            restored.permission_state(Permission::HardwareMetadata),
+            PermissionState::NotRequested
+        );
+    }
+
+    #[test]
+    fn retrying_a_failed_deny_persists_it() {
+        let (_directory, manager, mut host) = create_host_with_removable_storage();
+
+        host.grant_permission(Permission::ProcessMetadata).unwrap();
+        remove_storage(&manager);
+
+        assert!(host.deny_permission(Permission::ProcessMetadata).is_err());
+
+        restore_storage(&manager);
+        host.deny_permission(Permission::ProcessMetadata).unwrap();
+        drop(host);
+
+        let restored = RuntimeHost::new(&manager).unwrap();
+
+        assert_eq!(
+            restored.permission_state(Permission::ProcessMetadata),
+            PermissionState::Denied
+        );
+    }
+
+    #[test]
+    fn failed_grant_does_not_discard_an_earlier_unsaved_restriction() {
+        let (_directory, manager, mut host) = create_host_with_removable_storage();
+
+        host.grant_permission(Permission::HardwareMetadata).unwrap();
+        remove_storage(&manager);
+
+        assert!(matches!(
+            host.deny_permission(Permission::HardwareMetadata),
+            Err(RuntimeError::PermissionNotPersisted(_))
+        ));
+        assert!(matches!(
+            host.grant_permission(Permission::NetworkMetadata),
+            Err(RuntimeError::ConfigurationFailed(_))
+        ));
+
+        assert_eq!(
+            host.permission_state(Permission::HardwareMetadata),
+            PermissionState::Denied
+        );
+        assert_eq!(
+            host.permission_state(Permission::NetworkMetadata),
+            PermissionState::NotRequested
+        );
+        assert_memory_and_config_agree(&host);
+
+        restore_storage(&manager);
+        host.grant_permission(Permission::NetworkMetadata).unwrap();
+        drop(host);
+
+        let restored = RuntimeHost::new(&manager).unwrap();
+
+        assert_eq!(
+            restored.permission_state(Permission::HardwareMetadata),
+            PermissionState::Denied
+        );
+        assert!(restored.is_authorized(Permission::NetworkMetadata));
+    }
+
+    #[test]
+    fn memory_and_config_stay_consistent_after_mixed_failed_changes() {
+        let (_directory, manager, mut host) = create_host_with_removable_storage();
+
+        host.grant_permission(Permission::HardwareMetadata).unwrap();
+        host.grant_permission(Permission::NetworkMetadata).unwrap();
+        remove_storage(&manager);
+
+        assert!(host.deny_permission(Permission::HardwareMetadata).is_err());
+        assert!(host.revoke_permission(Permission::NetworkMetadata).is_err());
+        assert!(host.grant_permission(Permission::ProcessMetadata).is_err());
+
+        assert_eq!(
+            host.permission_state(Permission::HardwareMetadata),
+            PermissionState::Denied
+        );
+        assert_eq!(
+            host.permission_state(Permission::NetworkMetadata),
+            PermissionState::NotRequested
+        );
+        assert_eq!(
+            host.permission_state(Permission::ProcessMetadata),
+            PermissionState::NotRequested
+        );
+        assert!(!host.is_authorized(Permission::HardwareMetadata));
+        assert!(!host.is_authorized(Permission::NetworkMetadata));
+        assert!(!host.is_authorized(Permission::ProcessMetadata));
+        assert_memory_and_config_agree(&host);
     }
 
     #[test]
