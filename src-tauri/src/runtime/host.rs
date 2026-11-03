@@ -1,4 +1,4 @@
-use super::config::{ConfigManager, RuntimeConfig};
+use super::config::{ConfigDiagnostics, ConfigManager, RuntimeConfig};
 use super::error::RuntimeError;
 use super::lifecycle::LifecycleManager;
 use super::permissions::{Permission, PermissionManager, PermissionState};
@@ -7,22 +7,24 @@ use super::state::RuntimeStatus;
 pub struct RuntimeHost {
     lifecycle: LifecycleManager,
     config: RuntimeConfig,
+    config_diagnostics: ConfigDiagnostics,
     config_manager: ConfigManager,
     permissions: PermissionManager,
 }
 
 impl RuntimeHost {
     pub fn new(config_manager: &ConfigManager) -> Result<Self, RuntimeError> {
-        let config = config_manager
-            .load()
+        let report = config_manager
+            .load_with_report()
             .map_err(|error| RuntimeError::ConfigurationFailed(error.to_string()))?;
 
-        let permissions = PermissionManager::from_states(&config.permission_states);
+        let permissions = PermissionManager::from_states(&report.config.permission_states);
 
         Ok(Self {
             lifecycle: LifecycleManager::new(),
             permissions,
-            config,
+            config: report.config,
+            config_diagnostics: report.diagnostics,
             config_manager: config_manager.clone(),
         })
     }
@@ -53,6 +55,12 @@ impl RuntimeHost {
 
     pub fn config(&self) -> &RuntimeConfig {
         &self.config
+    }
+
+    /// What happened when the configuration was loaded: warnings, and whether
+    /// an unusable configuration was set aside and replaced by the defaults.
+    pub fn config_diagnostics(&self) -> &ConfigDiagnostics {
+        &self.config_diagnostics
     }
 
     pub fn permission_state(&self, permission: Permission) -> PermissionState {
@@ -508,6 +516,126 @@ mod tests {
             saved.permission_states.get(&Permission::HardwareMetadata),
             Some(&PermissionState::Granted)
         );
+    }
+
+    #[test]
+    fn diagnostics_are_empty_for_a_valid_configuration() {
+        let (_directory, manager) = create_manager();
+        fs::write(
+            manager.path(),
+            r#"{"schema_version": 1, "permission_states": {"hardware_metadata": "granted"}}"#,
+        )
+        .unwrap();
+
+        let host = RuntimeHost::new(&manager).unwrap();
+
+        assert_eq!(*host.config_diagnostics(), ConfigDiagnostics::default());
+        assert!(host.is_authorized(Permission::HardwareMetadata));
+    }
+
+    #[test]
+    fn host_reports_recovery_and_starts_with_nothing_granted() {
+        let (_directory, manager) = create_manager();
+        let corrupt = r#"{"permission_states": {"hardware_metadata": "granted", "process_metadata": "maybe"}}"#;
+        fs::write(manager.path(), corrupt).unwrap();
+
+        let host = RuntimeHost::new(&manager).unwrap();
+        let recovery = host
+            .config_diagnostics()
+            .recovery
+            .as_ref()
+            .expect("recovery expected");
+
+        assert!(recovery.reason.contains("invalid state"));
+        assert_eq!(
+            fs::read_to_string(&recovery.quarantined_path).unwrap(),
+            corrupt
+        );
+        for permission in ALL_PERMISSIONS {
+            assert!(!host.is_authorized(permission), "{permission:?}");
+        }
+        assert_memory_and_config_agree(&host);
+    }
+
+    #[test]
+    fn host_refuses_to_start_on_a_newer_configuration_and_leaves_it_alone() {
+        let (_directory, manager) = create_manager();
+        let newer =
+            r#"{"schema_version": 2, "permission_states": {"hardware_metadata": "granted"}}"#;
+        fs::write(manager.path(), newer).unwrap();
+
+        let error = RuntimeHost::new(&manager).err().expect("start must fail");
+
+        assert!(matches!(error, RuntimeError::ConfigurationFailed(_)));
+        assert!(error.to_string().contains("schema version 2"));
+        assert!(error.to_string().contains("not modified"));
+        assert_eq!(fs::read_to_string(manager.path()).unwrap(), newer);
+    }
+
+    #[test]
+    fn unknown_permissions_never_authorize_anything() {
+        let (_directory, manager) = create_manager();
+        fs::write(
+            manager.path(),
+            r#"{"permission_states": {"camera_access": "granted", "everything": "granted"}}"#,
+        )
+        .unwrap();
+
+        let host = RuntimeHost::new(&manager).unwrap();
+
+        assert_eq!(host.config_diagnostics().warnings.len(), 2);
+        assert!(host.config_diagnostics().recovery.is_none());
+        for permission in ALL_PERMISSIONS {
+            assert!(!host.is_authorized(permission), "{permission:?}");
+        }
+    }
+
+    #[test]
+    fn unknown_entries_survive_permission_changes() {
+        let (_directory, manager) = create_manager();
+        fs::write(
+            manager.path(),
+            r#"{
+              "schema_version": 1,
+              "future_flag": true,
+              "permission_states": {"camera_access": "granted"}
+            }"#,
+        )
+        .unwrap();
+
+        let mut host = RuntimeHost::new(&manager).unwrap();
+        host.grant_permission(Permission::HardwareMetadata).unwrap();
+        host.deny_permission(Permission::NetworkMetadata).unwrap();
+        host.revoke_permission(Permission::HardwareMetadata)
+            .unwrap();
+        drop(host);
+
+        let saved = manager.load().unwrap();
+
+        assert_eq!(saved.unknown_fields["future_flag"], serde_json::json!(true));
+        assert_eq!(
+            saved.unknown_permissions["camera_access"],
+            serde_json::json!("granted")
+        );
+        assert_eq!(
+            saved.permission_states.get(&Permission::NetworkMetadata),
+            Some(&PermissionState::Denied)
+        );
+    }
+
+    #[test]
+    fn recovered_host_persists_new_decisions_normally() {
+        let (_directory, manager) = create_manager();
+        fs::write(manager.path(), "{ corrupt").unwrap();
+
+        let mut host = RuntimeHost::new(&manager).unwrap();
+        host.grant_permission(Permission::HardwareMetadata).unwrap();
+        drop(host);
+
+        let restored = RuntimeHost::new(&manager).unwrap();
+
+        assert!(restored.config_diagnostics().recovery.is_none());
+        assert!(restored.is_authorized(Permission::HardwareMetadata));
     }
 
     #[test]
