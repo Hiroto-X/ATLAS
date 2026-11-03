@@ -10,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use super::schema::RuntimeConfig;
+use super::validation::parse_config_bytes;
 
 /// Suffix of the temporary file used while migrating. It is intentionally not
 /// `.json`, so a half-written copy can never be mistaken for a configuration.
@@ -77,9 +77,11 @@ fn copy_validated(legacy_path: &Path, current_path: &Path, temp_path: &Path) -> 
     let contents = fs::read(legacy_path)
         .map_err(|error| migration_error(legacy_path, current_path, "read", error))?;
 
-    // Validate before writing anything. The original bytes are copied as they
-    // are, so no value (including permission decisions) is altered.
-    serde_json::from_slice::<RuntimeConfig>(&contents).map_err(|error| {
+    // Validate before writing anything, using the same rules as loading, so a
+    // file the loader accepts (for example one with a byte order mark) can be
+    // migrated. The original bytes are copied as they are, so no value
+    // (including permission decisions) is altered.
+    parse_config_bytes(&contents).map_err(|error| {
         migration_error(
             legacy_path,
             current_path,
@@ -151,6 +153,7 @@ fn migration_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::config::RuntimeConfig;
     use crate::runtime::permissions::{Permission, PermissionState};
     use std::collections::BTreeMap;
 
@@ -396,6 +399,63 @@ mod tests {
 
         assert_eq!(fs::read_to_string(&current).unwrap(), LEGACY_JSON);
         assert!(!temp_file_exists(&current));
+    }
+
+    #[test]
+    fn byte_order_mark_legacy_configuration_migrates_unchanged() {
+        let (_directory, legacy, current) = locations();
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(LEGACY_JSON.as_bytes());
+        fs::write(&legacy, &bytes).unwrap();
+
+        let outcome = migrate_legacy_config(&legacy, &current).unwrap();
+
+        assert_eq!(outcome, MigrationOutcome::Migrated);
+        assert_eq!(fs::read(&current).unwrap(), bytes);
+        assert_eq!(fs::read(&legacy).unwrap(), bytes);
+    }
+
+    #[test]
+    fn legacy_configuration_with_unknown_entries_migrates_unchanged() {
+        let (_directory, legacy, current) = locations();
+        let json = r#"{"schema_version":1,"future_flag":true,"permission_states":{"camera_access":"granted"}}"#;
+        fs::write(&legacy, json).unwrap();
+
+        let outcome = migrate_legacy_config(&legacy, &current).unwrap();
+
+        assert_eq!(outcome, MigrationOutcome::Migrated);
+        assert_eq!(fs::read_to_string(&current).unwrap(), json);
+    }
+
+    #[test]
+    fn legacy_configuration_from_a_newer_version_is_not_migrated() {
+        let (_directory, legacy, current) = locations();
+        let newer = r#"{"schema_version": 2}"#;
+        fs::write(&legacy, newer).unwrap();
+
+        let error = migrate_legacy_config(&legacy, &current).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("failed to migrate configuration"));
+        assert!(error.to_string().contains("schema version 2"));
+        assert!(!current.exists());
+        assert!(!temp_file_exists(&current));
+        assert_eq!(fs::read_to_string(&legacy).unwrap(), newer);
+    }
+
+    #[test]
+    fn legacy_configuration_with_an_invalid_permission_state_is_not_migrated() {
+        let (_directory, legacy, current) = locations();
+        let body = r#"{"permission_states": {"hardware_metadata": "allowed"}}"#;
+        fs::write(&legacy, body).unwrap();
+
+        let error = migrate_legacy_config(&legacy, &current).unwrap_err();
+
+        assert!(error.to_string().contains("validate"));
+        assert!(error.to_string().contains("invalid state"));
+        assert!(!current.exists());
+        assert_eq!(fs::read_to_string(&legacy).unwrap(), body);
     }
 
     #[test]
