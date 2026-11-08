@@ -11,6 +11,17 @@ pub enum Permission {
     NetworkMetadata,
 }
 
+impl Permission {
+    /// Every permission, in a stable order.
+    pub const ALL: [Permission; 5] = [
+        Permission::HardwareMetadata,
+        Permission::ProcessMetadata,
+        Permission::SoftwareInventory,
+        Permission::FilesystemMetadata,
+        Permission::NetworkMetadata,
+    ];
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionState {
@@ -78,6 +89,25 @@ impl Default for PermissionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Exhaustive on purpose: adding a permission breaks this until `ALL` and
+    /// this list are updated.
+    fn position(permission: Permission) -> usize {
+        match permission {
+            Permission::HardwareMetadata => 0,
+            Permission::ProcessMetadata => 1,
+            Permission::SoftwareInventory => 2,
+            Permission::FilesystemMetadata => 3,
+            Permission::NetworkMetadata => 4,
+        }
+    }
+
+    #[test]
+    fn all_lists_every_permission_once_in_order() {
+        for (index, permission) in Permission::ALL.iter().enumerate() {
+            assert_eq!(position(*permission), index);
+        }
+    }
 
     #[test]
     fn permissions_are_not_requested_by_default() {

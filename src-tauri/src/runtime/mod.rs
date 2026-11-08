@@ -3,6 +3,7 @@ pub mod error;
 pub mod host;
 pub mod lifecycle;
 pub mod permissions;
+pub mod service;
 pub mod state;
 
 pub use host::RuntimeHost;

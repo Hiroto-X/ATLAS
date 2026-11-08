@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Explore your digital universe"
 authors = ["ATLAS"]
 edition = "2021"
+rust-version = "1.89"
 
 [lib]
 name = "atlas_lib"

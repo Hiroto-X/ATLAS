@@ -1,3 +1,5 @@
+use std::collections::{BTreeMap, BTreeSet};
+
 use super::config::{ConfigDiagnostics, ConfigManager, RuntimeConfig};
 use super::error::RuntimeError;
 use super::lifecycle::LifecycleManager;
@@ -10,6 +12,19 @@ pub struct RuntimeHost {
     config_diagnostics: ConfigDiagnostics,
     config_manager: ConfigManager,
     permissions: PermissionManager,
+    /// Permission decisions as last read from, or written to, `runtime.json`.
+    /// Used to tell changes made outside this host from this host's own.
+    persisted_states: BTreeMap<Permission, PermissionState>,
+}
+
+fn state_of(
+    states: &BTreeMap<Permission, PermissionState>,
+    permission: Permission,
+) -> PermissionState {
+    states
+        .get(&permission)
+        .copied()
+        .unwrap_or(PermissionState::NotRequested)
 }
 
 impl RuntimeHost {
@@ -23,6 +38,7 @@ impl RuntimeHost {
         Ok(Self {
             lifecycle: LifecycleManager::new(),
             permissions,
+            persisted_states: report.config.permission_states.clone(),
             config: report.config,
             config_diagnostics: report.diagnostics,
             config_manager: config_manager.clone(),
@@ -115,11 +131,33 @@ impl RuntimeHost {
     /// so they stay consistent. Every save writes the full configuration, so a
     /// restriction that could not be saved is written by the next successful
     /// save of any permission.
+    ///
+    /// Before anything is saved, the file on disk is compared with what this
+    /// host last read or wrote, so a save never silently overwrites a change
+    /// made outside this host (see `reconcile_with_disk`). A file that cannot
+    /// be read or interpreted is never overwritten.
     fn persist_permission_state(
         &mut self,
         permission: Permission,
         state: PermissionState,
     ) -> Result<(), RuntimeError> {
+        match self.config_manager.read_current() {
+            Ok(Some(disk)) => {
+                if let Err(reason) = self.reconcile_with_disk(disk) {
+                    return self.refuse_to_save(permission, state, reason);
+                }
+            }
+            // No file: it was removed, and saving will create it again.
+            Ok(None) => {}
+            Err(error) => {
+                return self.refuse_to_save(
+                    permission,
+                    state,
+                    format!("the saved configuration could not be read: {error}"),
+                );
+            }
+        }
+
         let mut updated_config = self.config.clone();
 
         match state {
@@ -140,6 +178,7 @@ impl RuntimeHost {
             })?;
 
             self.permissions.grant(permission);
+            self.persisted_states = updated_config.permission_states.clone();
             self.config = updated_config;
 
             return Ok(());
@@ -159,7 +198,102 @@ impl RuntimeHost {
             RuntimeError::PermissionNotPersisted(format!(
                 "{permission:?} was set to {state:?} in memory, but saving it failed: {error}"
             ))
-        })
+        })?;
+
+        self.persisted_states = self.config.permission_states.clone();
+
+        Ok(())
+    }
+
+    /// Compares the file on disk with what this host last read or wrote, and
+    /// decides what to do about changes made outside this host.
+    ///
+    /// * A permission that now **restricts** (denied or not requested) is
+    ///   adopted straight away. This can only remove authorization, never add
+    ///   it, so a stale host cannot bring back a permission that was revoked
+    ///   elsewhere.
+    /// * A permission that is now **granted** on disk, but not in memory, is
+    ///   not adopted: nothing is granted behind the user's back. It is not
+    ///   overwritten either, so the save is refused (`Err`) and the grant
+    ///   takes effect the next time the runtime starts.
+    /// * Everything else in the file (settings, unrecognised entries) is
+    ///   taken from disk, so it is kept when this host saves.
+    fn reconcile_with_disk(&mut self, disk: RuntimeConfig) -> Result<(), String> {
+        let permissions: BTreeSet<Permission> = disk
+            .permission_states
+            .keys()
+            .chain(self.persisted_states.keys())
+            .copied()
+            .collect();
+
+        let mut external_grant = None;
+
+        for permission in permissions {
+            let on_disk = state_of(&disk.permission_states, permission);
+
+            if on_disk == state_of(&self.persisted_states, permission) {
+                continue;
+            }
+
+            if on_disk == PermissionState::Granted {
+                if self.permissions.get_state(permission) != PermissionState::Granted {
+                    external_grant = Some(permission);
+                }
+            } else {
+                self.apply_restriction(permission, on_disk);
+            }
+        }
+
+        if let Some(permission) = external_grant {
+            return Err(format!(
+                "{permission:?} was granted in the configuration file outside ATLAS; \
+                 restart ATLAS to apply that change"
+            ));
+        }
+
+        self.config.schema_version = disk.schema_version;
+        self.config.background_enabled = disk.background_enabled;
+        self.config.launch_at_login = disk.launch_at_login;
+        self.config.unknown_permissions = disk.unknown_permissions;
+        self.config.unknown_fields = disk.unknown_fields;
+        self.persisted_states = disk.permission_states;
+
+        Ok(())
+    }
+
+    /// Applies a restriction (`Denied` or `NotRequested`) to the permission
+    /// manager and to `self.config` together.
+    fn apply_restriction(&mut self, permission: Permission, state: PermissionState) {
+        if state == PermissionState::Denied {
+            self.permissions.deny(permission);
+            self.config.permission_states.insert(permission, state);
+        } else {
+            self.permissions.revoke(permission);
+            self.config.permission_states.remove(&permission);
+        }
+    }
+
+    /// Handles a change that cannot be saved because the file on disk cannot
+    /// be trusted or overwritten. A grant is refused. A restriction still
+    /// takes effect in memory, as everywhere else, and is reported as not
+    /// persisted.
+    fn refuse_to_save(
+        &mut self,
+        permission: Permission,
+        state: PermissionState,
+        reason: String,
+    ) -> Result<(), RuntimeError> {
+        if state == PermissionState::Granted {
+            return Err(RuntimeError::ConfigurationFailed(format!(
+                "{permission:?} was not granted: {reason}"
+            )));
+        }
+
+        self.apply_restriction(permission, state);
+
+        Err(RuntimeError::PermissionNotPersisted(format!(
+            "{permission:?} was set to {state:?} in memory, but it was not saved: {reason}"
+        )))
     }
 }
 
@@ -908,5 +1042,153 @@ mod tests {
         let restored = RuntimeHost::new(&manager).unwrap();
 
         assert!(restored.is_authorized(Permission::HardwareMetadata));
+    }
+
+    // --- stale configuration writers (2.6.5) --------------------------------
+
+    fn write_external(manager: &ConfigManager, json: &str) {
+        fs::write(manager.path(), json).unwrap();
+    }
+
+    #[test]
+    fn external_denial_is_adopted_before_the_next_save() {
+        let (_directory, manager) = create_manager();
+        let mut host = RuntimeHost::new(&manager).unwrap();
+        host.grant_permission(Permission::HardwareMetadata).unwrap();
+        write_external(
+            &manager,
+            r#"{"permission_states": {"hardware_metadata": "denied"}}"#,
+        );
+
+        host.grant_permission(Permission::NetworkMetadata).unwrap();
+
+        assert!(!host.is_authorized(Permission::HardwareMetadata));
+        assert_eq!(
+            host.permission_state(Permission::HardwareMetadata),
+            PermissionState::Denied
+        );
+        let saved = manager.load().unwrap();
+        assert_eq!(
+            saved.permission_states[&Permission::HardwareMetadata],
+            PermissionState::Denied
+        );
+        assert_eq!(
+            saved.permission_states[&Permission::NetworkMetadata],
+            PermissionState::Granted
+        );
+    }
+
+    #[test]
+    fn external_grant_is_refused_and_not_overwritten() {
+        let (_directory, manager) = create_manager();
+        let mut host = RuntimeHost::new(&manager).unwrap();
+        let external = r#"{"permission_states": {"process_metadata": "granted"}}"#;
+        write_external(&manager, external);
+
+        let error = host
+            .grant_permission(Permission::NetworkMetadata)
+            .unwrap_err();
+
+        assert!(matches!(error, RuntimeError::ConfigurationFailed(_)));
+        assert!(!host.is_authorized(Permission::ProcessMetadata));
+        assert!(!host.is_authorized(Permission::NetworkMetadata));
+        assert_eq!(fs::read_to_string(manager.path()).unwrap(), external);
+    }
+
+    #[test]
+    fn external_grant_does_not_stop_a_denial_from_applying() {
+        let (_directory, manager) = create_manager();
+        let mut host = RuntimeHost::new(&manager).unwrap();
+        host.grant_permission(Permission::HardwareMetadata).unwrap();
+        write_external(
+            &manager,
+            r#"{"permission_states": {"hardware_metadata": "granted", "process_metadata": "granted"}}"#,
+        );
+
+        let result = host.deny_permission(Permission::HardwareMetadata);
+
+        assert!(!host.is_authorized(Permission::HardwareMetadata));
+        assert!(!host.is_authorized(Permission::ProcessMetadata));
+        assert!(matches!(
+            result,
+            Err(RuntimeError::PermissionNotPersisted(_))
+        ));
+    }
+
+    #[test]
+    fn a_newer_configuration_appearing_mid_run_is_not_overwritten() {
+        let (_directory, manager) = create_manager();
+        let mut host = RuntimeHost::new(&manager).unwrap();
+        let newer = r#"{"schema_version": 99}"#;
+        write_external(&manager, newer);
+
+        assert!(host.grant_permission(Permission::HardwareMetadata).is_err());
+
+        assert!(!host.is_authorized(Permission::HardwareMetadata));
+        assert_eq!(fs::read_to_string(manager.path()).unwrap(), newer);
+    }
+
+    #[test]
+    fn an_unreadable_configuration_mid_run_is_not_overwritten() {
+        let (_directory, manager) = create_manager();
+        let mut host = RuntimeHost::new(&manager).unwrap();
+        write_external(&manager, "{ not json");
+
+        assert!(host.grant_permission(Permission::HardwareMetadata).is_err());
+
+        assert!(!host.is_authorized(Permission::HardwareMetadata));
+        assert_eq!(fs::read_to_string(manager.path()).unwrap(), "{ not json");
+        let entries = fs::read_dir(manager.path().parent().unwrap())
+            .unwrap()
+            .count();
+        assert_eq!(entries, 1, "nothing was quarantined or created");
+    }
+
+    #[test]
+    fn a_deleted_configuration_is_recreated_on_the_next_save() {
+        let (_directory, manager) = create_manager();
+        let mut host = RuntimeHost::new(&manager).unwrap();
+        host.grant_permission(Permission::HardwareMetadata).unwrap();
+        fs::remove_file(manager.path()).unwrap();
+
+        host.grant_permission(Permission::NetworkMetadata).unwrap();
+
+        let saved = manager.load().unwrap();
+        assert_eq!(saved.permission_states.len(), 2);
+    }
+
+    #[test]
+    fn other_external_settings_are_kept_when_saving() {
+        let (_directory, manager) = create_manager();
+        let mut host = RuntimeHost::new(&manager).unwrap();
+        write_external(
+            &manager,
+            r#"{"background_enabled": true, "future_setting": 7}"#,
+        );
+
+        host.grant_permission(Permission::HardwareMetadata).unwrap();
+
+        let text = fs::read_to_string(manager.path()).unwrap();
+        assert!(text.contains("future_setting"));
+        assert!(manager.load().unwrap().background_enabled);
+    }
+
+    #[test]
+    fn a_stale_host_cannot_undo_another_hosts_denial() {
+        let (_directory, manager) = create_manager();
+        let mut stale = RuntimeHost::new(&manager).unwrap();
+        stale
+            .grant_permission(Permission::HardwareMetadata)
+            .unwrap();
+        let mut other = RuntimeHost::new(&manager).unwrap();
+        other.deny_permission(Permission::HardwareMetadata).unwrap();
+
+        stale.grant_permission(Permission::ProcessMetadata).unwrap();
+
+        assert!(!stale.is_authorized(Permission::HardwareMetadata));
+        assert_eq!(
+            manager.load().unwrap().permission_states[&Permission::HardwareMetadata],
+            PermissionState::Denied
+        );
     }
 }

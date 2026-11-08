@@ -1,4 +1,5 @@
 mod atomic;
+pub mod instance_lock;
 pub mod manager;
 pub mod migration;
 pub mod recovery;
