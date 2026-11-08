@@ -4,6 +4,7 @@ use std::{
 };
 
 use super::atomic::atomic_write;
+use super::instance_lock::LOCK_FILE_NAME;
 use super::migration::migrate_legacy_config;
 use super::recovery::{quarantine, ConfigDiagnostics, ConfigRecovery, LoadReport};
 use super::schema::RuntimeConfig;
@@ -173,6 +174,49 @@ impl ConfigManager {
 
     pub fn path(&self) -> &Path {
         &self.config_path
+    }
+
+    /// The per-user directory `new` stores the configuration in. It is not
+    /// created here. The runtime locks a file in it before calling `new`,
+    /// because `new` may migrate the old configuration.
+    pub fn local_config_dir(app_name: &str) -> io::Result<PathBuf> {
+        let base_dir =
+            directories::ProjectDirs::from("com", "atlas", app_name).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "Unable to locate application configuration directory",
+                )
+            })?;
+
+        Ok(base_dir.config_local_dir().to_path_buf())
+    }
+
+    /// Where the single-instance lock for this configuration lives.
+    pub fn lock_path(&self) -> PathBuf {
+        self.config_path.with_file_name(LOCK_FILE_NAME)
+    }
+
+    /// Reads the configuration as it is on disk right now, without creating,
+    /// replacing or quarantining anything. `None` means there is no file.
+    /// A file that cannot be read or interpreted is an error.
+    pub fn read_current(&self) -> io::Result<Option<RuntimeConfig>> {
+        let bytes = match fs::read(&self.config_path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+
+        match parse_config_bytes(&bytes) {
+            Ok(parsed) => Ok(Some(parsed.config)),
+            Err(error @ ConfigParseError::UnsupportedSchemaVersion { .. }) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                error.to_string(),
+            )),
+            Err(error) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                error.to_string(),
+            )),
+        }
     }
 
     #[cfg(test)]
@@ -896,5 +940,48 @@ mod tests {
                 .to_lowercase()
                 .contains("appdata\\roaming"));
         }
+    }
+
+    #[test]
+    fn lock_path_is_next_to_the_configuration() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = ConfigManager::new_for_test(directory.path().join("runtime.json"));
+
+        assert_eq!(manager.lock_path(), directory.path().join("runtime.lock"));
+    }
+
+    #[test]
+    fn read_current_does_not_create_or_change_anything() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = ConfigManager::new_for_test(directory.path().join("runtime.json"));
+
+        assert!(manager.read_current().unwrap().is_none());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+
+        std::fs::write(manager.path(), "{ broken").unwrap();
+        let error = manager.read_current().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(std::fs::read_to_string(manager.path()).unwrap(), "{ broken");
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn read_current_refuses_a_newer_schema() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = ConfigManager::new_for_test(directory.path().join("runtime.json"));
+        std::fs::write(manager.path(), r#"{"schema_version": 99}"#).unwrap();
+
+        let error = manager.read_current().unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn read_current_returns_a_valid_configuration() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = ConfigManager::new_for_test(directory.path().join("runtime.json"));
+        std::fs::write(manager.path(), r#"{"background_enabled": true}"#).unwrap();
+
+        assert!(manager.read_current().unwrap().unwrap().background_enabled);
     }
 }
