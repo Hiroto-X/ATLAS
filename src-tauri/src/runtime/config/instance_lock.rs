@@ -141,7 +141,10 @@ mod tests {
         let (_directory, path) = lock_path();
         fs::write(&path, "left alone").unwrap();
 
-        let _lock = InstanceLock::acquire(&path).unwrap();
+        let lock = InstanceLock::acquire(&path).unwrap();
+        // On Windows the lock is mandatory and blocks reads through other
+        // handles, so release it before reading the file back.
+        drop(lock);
 
         assert_eq!(fs::read_to_string(&path).unwrap(), "left alone");
     }
