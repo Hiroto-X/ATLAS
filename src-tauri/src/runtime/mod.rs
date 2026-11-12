@@ -1,6 +1,8 @@
 pub mod config;
 pub mod error;
 pub mod host;
+#[cfg(test)]
+mod integration_tests;
 pub mod lifecycle;
 pub mod permissions;
 pub mod service;
