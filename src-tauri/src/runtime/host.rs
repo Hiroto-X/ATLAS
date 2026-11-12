@@ -65,6 +65,14 @@ impl RuntimeHost {
         self.lifecycle.complete_shutdown()
     }
 
+    /// Shuts the runtime down from any state, ending in `Stopped`. Safe to
+    /// call more than once. Nothing is written to the configuration: the
+    /// saved permission decisions are left exactly as they are.
+    pub fn shutdown(&mut self) -> Result<(), RuntimeError> {
+        self.lifecycle.begin_shutdown()?;
+        self.lifecycle.complete_shutdown()
+    }
+
     pub fn status(&self) -> &RuntimeStatus {
         self.lifecycle.status()
     }
@@ -111,8 +119,11 @@ impl RuntimeHost {
         self.persist_permission_state(permission, PermissionState::NotRequested)
     }
 
+    /// Whether `permission` may be used right now: it must be granted and the
+    /// runtime must be `Running`. While starting, paused, shutting down or
+    /// stopped, nothing is authorized, whatever the saved decision is.
     pub fn is_authorized(&self, permission: Permission) -> bool {
-        self.permissions.is_granted(permission)
+        self.lifecycle.is_running() && self.permissions.is_granted(permission)
     }
 
     /// Applies a permission decision and saves it to `runtime.json`.
@@ -126,6 +137,9 @@ impl RuntimeHost {
     /// * `Denied` and `NotRequested` (revoke) remove authorization, so they
     ///   are applied in memory first and saved afterwards. A failed save
     ///   returns `PermissionNotPersisted` and the restriction stays in effect.
+    ///
+    /// Changes are rejected with `InvalidState` once shutdown has begun, before
+    /// anything is read or written.
     ///
     /// The permission manager and `self.config` are always updated together,
     /// so they stay consistent. Every save writes the full configuration, so a
@@ -141,6 +155,12 @@ impl RuntimeHost {
         permission: Permission,
         state: PermissionState,
     ) -> Result<(), RuntimeError> {
+        if !self.lifecycle.allows_permission_changes() {
+            return Err(RuntimeError::InvalidState(
+                "Permissions cannot be changed once the runtime is shutting down".into(),
+            ));
+        }
+
         match self.config_manager.read_current() {
             Ok(Some(disk)) => {
                 if let Err(reason) = self.reconcile_with_disk(disk) {
@@ -442,6 +462,7 @@ mod tests {
     #[test]
     fn runtime_host_can_grant_permission() {
         let (_directory, mut host) = create_host();
+        host.start().unwrap();
 
         host.grant_permission(Permission::HardwareMetadata).unwrap();
 
@@ -482,6 +503,7 @@ mod tests {
     #[test]
     fn permissions_are_independent_inside_runtime_host() {
         let (_directory, mut host) = create_host();
+        host.start().unwrap();
 
         host.grant_permission(Permission::HardwareMetadata).unwrap();
         host.deny_permission(Permission::NetworkMetadata).unwrap();
@@ -496,10 +518,12 @@ mod tests {
         let (_directory, manager) = create_manager();
 
         let mut host = RuntimeHost::new(&manager).unwrap();
+        host.start().unwrap();
         host.grant_permission(Permission::HardwareMetadata).unwrap();
         drop(host);
 
-        let restored = RuntimeHost::new(&manager).unwrap();
+        let mut restored = RuntimeHost::new(&manager).unwrap();
+        restored.start().unwrap();
 
         assert!(restored.is_authorized(Permission::HardwareMetadata));
         assert_eq!(
@@ -661,7 +685,8 @@ mod tests {
         )
         .unwrap();
 
-        let host = RuntimeHost::new(&manager).unwrap();
+        let mut host = RuntimeHost::new(&manager).unwrap();
+        host.start().unwrap();
 
         assert_eq!(*host.config_diagnostics(), ConfigDiagnostics::default());
         assert!(host.is_authorized(Permission::HardwareMetadata));
@@ -763,10 +788,12 @@ mod tests {
         fs::write(manager.path(), "{ corrupt").unwrap();
 
         let mut host = RuntimeHost::new(&manager).unwrap();
+        host.start().unwrap();
         host.grant_permission(Permission::HardwareMetadata).unwrap();
         drop(host);
 
-        let restored = RuntimeHost::new(&manager).unwrap();
+        let mut restored = RuntimeHost::new(&manager).unwrap();
+        restored.start().unwrap();
 
         assert!(restored.config_diagnostics().recovery.is_none());
         assert!(restored.is_authorized(Permission::HardwareMetadata));
@@ -868,6 +895,7 @@ mod tests {
     #[test]
     fn unsaved_deny_is_persisted_by_a_later_successful_save() {
         let (_directory, manager, mut host) = create_host_with_removable_storage();
+        host.start().unwrap();
 
         host.grant_permission(Permission::HardwareMetadata).unwrap();
         remove_storage(&manager);
@@ -890,7 +918,8 @@ mod tests {
         assert_memory_and_config_agree(&host);
         drop(host);
 
-        let restored = RuntimeHost::new(&manager).unwrap();
+        let mut restored = RuntimeHost::new(&manager).unwrap();
+        restored.start().unwrap();
 
         assert_eq!(
             restored.permission_state(Permission::HardwareMetadata),
@@ -960,6 +989,7 @@ mod tests {
     #[test]
     fn failed_grant_does_not_discard_an_earlier_unsaved_restriction() {
         let (_directory, manager, mut host) = create_host_with_removable_storage();
+        host.start().unwrap();
 
         host.grant_permission(Permission::HardwareMetadata).unwrap();
         remove_storage(&manager);
@@ -987,7 +1017,8 @@ mod tests {
         host.grant_permission(Permission::NetworkMetadata).unwrap();
         drop(host);
 
-        let restored = RuntimeHost::new(&manager).unwrap();
+        let mut restored = RuntimeHost::new(&manager).unwrap();
+        restored.start().unwrap();
 
         assert_eq!(
             restored.permission_state(Permission::HardwareMetadata),
@@ -1029,6 +1060,7 @@ mod tests {
     #[test]
     fn permission_change_succeeds_once_storage_is_available_again() {
         let (_directory, manager, mut host) = create_host_with_removable_storage();
+        host.start().unwrap();
         remove_storage(&manager);
 
         assert!(host.grant_permission(Permission::HardwareMetadata).is_err());
@@ -1039,7 +1071,8 @@ mod tests {
         host.grant_permission(Permission::HardwareMetadata).unwrap();
         drop(host);
 
-        let restored = RuntimeHost::new(&manager).unwrap();
+        let mut restored = RuntimeHost::new(&manager).unwrap();
+        restored.start().unwrap();
 
         assert!(restored.is_authorized(Permission::HardwareMetadata));
     }
@@ -1190,5 +1223,203 @@ mod tests {
             manager.load().unwrap().permission_states[&Permission::HardwareMetadata],
             PermissionState::Denied
         );
+    }
+
+    // --- lifecycle-aware authorization and shutdown (2.6.6) ------------------
+
+    fn granted_running_host() -> (tempfile::TempDir, ConfigManager, RuntimeHost) {
+        let (directory, manager) = create_manager();
+        let mut host = RuntimeHost::new(&manager).unwrap();
+        host.start().unwrap();
+        host.grant_permission(Permission::HardwareMetadata).unwrap();
+
+        (directory, manager, host)
+    }
+
+    #[test]
+    fn a_granted_permission_is_authorized_only_while_running() {
+        let (_directory, _manager, mut host) = granted_running_host();
+        assert!(host.is_authorized(Permission::HardwareMetadata));
+
+        host.pause().unwrap();
+        assert!(!host.is_authorized(Permission::HardwareMetadata));
+
+        host.resume().unwrap();
+        assert!(host.is_authorized(Permission::HardwareMetadata));
+
+        host.begin_shutdown().unwrap();
+        assert!(!host.is_authorized(Permission::HardwareMetadata));
+
+        host.complete_shutdown().unwrap();
+        assert!(!host.is_authorized(Permission::HardwareMetadata));
+    }
+
+    #[test]
+    fn nothing_is_authorized_before_start_even_if_granted_on_disk() {
+        let (_directory, manager, _host) = granted_running_host();
+
+        let restored = RuntimeHost::new(&manager).unwrap();
+
+        assert_eq!(
+            restored.permission_state(Permission::HardwareMetadata),
+            PermissionState::Granted
+        );
+        assert!(!restored.is_authorized(Permission::HardwareMetadata));
+    }
+
+    #[test]
+    fn pausing_does_not_change_the_stored_decision() {
+        let (_directory, manager, mut host) = granted_running_host();
+
+        host.pause().unwrap();
+
+        assert_eq!(
+            host.permission_state(Permission::HardwareMetadata),
+            PermissionState::Granted
+        );
+        assert_eq!(
+            manager.load().unwrap().permission_states[&Permission::HardwareMetadata],
+            PermissionState::Granted
+        );
+    }
+
+    #[test]
+    fn permissions_can_change_while_starting_running_and_paused() {
+        let (_directory, manager) = create_manager();
+        let mut host = RuntimeHost::new(&manager).unwrap();
+
+        host.grant_permission(Permission::HardwareMetadata).unwrap();
+        host.start().unwrap();
+        host.deny_permission(Permission::ProcessMetadata).unwrap();
+        host.pause().unwrap();
+        host.grant_permission(Permission::NetworkMetadata).unwrap();
+        host.revoke_permission(Permission::HardwareMetadata)
+            .unwrap();
+
+        let saved = manager.load().unwrap();
+        assert_eq!(saved.permission_states.len(), 2);
+        assert_eq!(
+            saved.permission_states[&Permission::NetworkMetadata],
+            PermissionState::Granted
+        );
+        // Granted while paused, so it applies once running again.
+        host.resume().unwrap();
+        assert!(host.is_authorized(Permission::NetworkMetadata));
+        assert!(!host.is_authorized(Permission::HardwareMetadata));
+    }
+
+    #[test]
+    fn permission_changes_are_rejected_once_shutdown_begins() {
+        let (_directory, manager, mut host) = granted_running_host();
+        host.begin_shutdown().unwrap();
+        let before = fs::read_to_string(manager.path()).unwrap();
+
+        for result in [
+            host.grant_permission(Permission::NetworkMetadata),
+            host.deny_permission(Permission::HardwareMetadata),
+            host.revoke_permission(Permission::HardwareMetadata),
+        ] {
+            assert!(matches!(result, Err(RuntimeError::InvalidState(_))));
+        }
+
+        assert_eq!(
+            host.permission_state(Permission::HardwareMetadata),
+            PermissionState::Granted
+        );
+        assert_eq!(fs::read_to_string(manager.path()).unwrap(), before);
+    }
+
+    #[test]
+    fn permission_changes_are_rejected_once_stopped() {
+        let (_directory, manager, mut host) = granted_running_host();
+        host.shutdown().unwrap();
+        let before = fs::read_to_string(manager.path()).unwrap();
+
+        assert!(matches!(
+            host.grant_permission(Permission::NetworkMetadata),
+            Err(RuntimeError::InvalidState(_))
+        ));
+        assert!(matches!(
+            host.deny_permission(Permission::HardwareMetadata),
+            Err(RuntimeError::InvalidState(_))
+        ));
+        assert_eq!(fs::read_to_string(manager.path()).unwrap(), before);
+    }
+
+    #[test]
+    fn a_rejected_change_does_not_touch_a_changed_file() {
+        let (_directory, manager, mut host) = granted_running_host();
+        host.shutdown().unwrap();
+        let external = r#"{"permission_states": {"process_metadata": "granted"}}"#;
+        write_external(&manager, external);
+
+        assert!(host.grant_permission(Permission::NetworkMetadata).is_err());
+
+        assert_eq!(fs::read_to_string(manager.path()).unwrap(), external);
+    }
+
+    #[test]
+    fn shutdown_works_from_every_live_state_and_ends_stopped() {
+        for steps in [0, 1, 2] {
+            let (_directory, manager) = create_manager();
+            let mut host = RuntimeHost::new(&manager).unwrap();
+            if steps >= 1 {
+                host.start().unwrap();
+            }
+            if steps >= 2 {
+                host.pause().unwrap();
+            }
+
+            host.shutdown().unwrap();
+
+            assert_eq!(*host.status(), RuntimeStatus::Stopped);
+        }
+    }
+
+    #[test]
+    fn shutdown_is_idempotent() {
+        let (_directory, _manager, mut host) = granted_running_host();
+
+        host.shutdown().unwrap();
+        host.shutdown().unwrap();
+        host.begin_shutdown().unwrap();
+        host.complete_shutdown().unwrap();
+
+        assert_eq!(*host.status(), RuntimeStatus::Stopped);
+    }
+
+    #[test]
+    fn shutdown_keeps_the_saved_decisions_and_writes_nothing() {
+        let (_directory, manager, mut host) = granted_running_host();
+        let before = fs::read_to_string(manager.path()).unwrap();
+
+        host.shutdown().unwrap();
+
+        assert_eq!(fs::read_to_string(manager.path()).unwrap(), before);
+        let mut next = RuntimeHost::new(&manager).unwrap();
+        next.start().unwrap();
+        assert!(next.is_authorized(Permission::HardwareMetadata));
+    }
+
+    #[test]
+    fn a_stopped_host_cannot_be_started_again() {
+        let (_directory, _manager, mut host) = granted_running_host();
+        host.shutdown().unwrap();
+
+        assert!(host.start().is_err());
+        assert!(host.resume().is_err());
+        assert_eq!(*host.status(), RuntimeStatus::Stopped);
+        assert!(!host.is_authorized(Permission::HardwareMetadata));
+    }
+
+    #[test]
+    fn a_failed_start_leaves_the_host_unauthorized() {
+        let (_directory, _manager, mut host) = granted_running_host();
+
+        // Already running, so starting again fails and changes nothing.
+        assert!(host.start().is_err());
+
+        assert_eq!(*host.status(), RuntimeStatus::Running);
+        assert!(host.is_authorized(Permission::HardwareMetadata));
     }
 }

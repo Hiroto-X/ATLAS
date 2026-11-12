@@ -344,8 +344,7 @@ impl RuntimeService {
         // Exiting must not be blocked by a poisoned lock.
         let mut host = running.host.lock().unwrap_or_else(PoisonError::into_inner);
 
-        let _ = host.begin_shutdown();
-        let _ = host.complete_shutdown();
+        let _ = host.shutdown();
     }
 
     fn change_permission(
@@ -918,5 +917,77 @@ mod tests {
             value,
             serde_json::json!({"code": "some_code", "message": "Some text."})
         );
+    }
+
+    // --- lifecycle (2.6.6) ----------------------------------------------------
+
+    #[test]
+    fn permission_commands_are_rejected_after_shutdown() {
+        let (_directory, manager) = manager();
+        let service = RuntimeService::start(&manager);
+        service
+            .grant_permission(Permission::HardwareMetadata)
+            .unwrap();
+
+        service.shutdown();
+
+        for result in [
+            service.grant_permission(Permission::NetworkMetadata),
+            service.deny_permission(Permission::HardwareMetadata),
+            service.revoke_permission(Permission::HardwareMetadata),
+        ] {
+            assert_eq!(result.unwrap_err().code, "invalid_state");
+        }
+    }
+
+    #[test]
+    fn nothing_is_reported_authorized_after_shutdown_but_decisions_remain_visible() {
+        let (_directory, manager) = manager();
+        let service = RuntimeService::start(&manager);
+        service
+            .grant_permission(Permission::HardwareMetadata)
+            .unwrap();
+
+        service.shutdown();
+        let permissions = service.permissions().unwrap();
+        let hardware = permissions
+            .iter()
+            .find(|dto| dto.permission == Permission::HardwareMetadata)
+            .unwrap();
+
+        assert_eq!(hardware.state, PermissionState::Granted);
+        assert!(!hardware.authorized);
+        assert!(permissions.iter().all(|dto| !dto.authorized));
+    }
+
+    #[test]
+    fn a_granted_permission_is_authorized_while_running() {
+        let (_directory, manager) = manager();
+        let service = RuntimeService::start(&manager);
+
+        let granted = service
+            .grant_permission(Permission::HardwareMetadata)
+            .unwrap();
+
+        assert!(granted.authorized);
+    }
+
+    #[test]
+    fn shutdown_keeps_decisions_for_the_next_start() {
+        let (_directory, manager) = manager();
+        let first = RuntimeService::start(&manager);
+        first
+            .grant_permission(Permission::HardwareMetadata)
+            .unwrap();
+        first.shutdown();
+        drop(first);
+
+        let second = RuntimeService::start(&manager);
+
+        assert!(second
+            .permissions()
+            .unwrap()
+            .iter()
+            .any(|dto| dto.permission == Permission::HardwareMetadata && dto.authorized));
     }
 }
