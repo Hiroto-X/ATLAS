@@ -451,7 +451,8 @@ mod tests {
         fs::write(roaming.join("runtime.json"), ROAMING_JSON).unwrap();
 
         let manager = ConfigManager::from_directories(&local, &roaming).unwrap();
-        let host = RuntimeHost::new(&manager).unwrap();
+        let mut host = RuntimeHost::new(&manager).unwrap();
+        host.start().unwrap();
 
         assert!(host.is_authorized(Permission::HardwareMetadata));
         assert_eq!(
