@@ -166,32 +166,24 @@ ATLAS is currently in early development.
 * Basic application interface.
 * Frontend and backend tests.
 
-### Phase 2 — Runtime Infrastructure 🟡
+### Phase 2 — Runtime Infrastructure ✅
 
-Implemented:
+* Runtime Core and Runtime Lifecycle Manager (Starting, Running, Paused, ShuttingDown, Stopped).
+* Permission Manager with persisted decisions. Grants are saved before they apply, and denials and revocations take effect immediately.
+* Permissions are authorized only while the runtime is Running. Changes are rejected once shutdown begins.
+* Runtime configuration in the Local AppData directory, with one-time migration from the old Roaming location.
+* Atomic configuration writes, validation, schema versioning, and quarantine of damaged files.
+* A single managed `RuntimeHost` behind Tauri commands, with safe error codes, and an operating-system file lock that prevents a second ATLAS from using the same configuration.
+* Protection against stale writers overwriting newer permission decisions.
+* End-to-end runtime integration tests.
 
-* Runtime Core.
-* Runtime Lifecycle Manager.
-* Runtime Configuration Manager.
-* Configuration loading and saving.
-* Permission Manager.
-* RuntimeHost integration with permissions.
-* Permission state serialization.
-* Permission persistence in configuration.
-
-Currently working on:
-
-* PermissionManager persistence integration.
-* RuntimeHost restoration of saved permission decisions.
-* Additional persistence and integration tests.
-
-**Current test status:** 31 Rust tests passing at the last verified checkpoint.
+**Current test status:** 251 Rust runtime tests, 4 Rust `get_system_info` tests, and 8 frontend tests were passing at the end of Phase 2.6.
 
 ### Upcoming Phases
 
 | Phase | Component                 | Status  |
 | ----- | ------------------------- | ------- |
-| 3     | Mirror Engine             | Planned |
+| 3     | Mirror Engine             | Specification in review |
 | 4     | Graph Engine              | Planned |
 | 5     | Universe UI — 2D          | Planned |
 | 6     | History Engine            | Planned |
@@ -250,14 +242,21 @@ ATLAS/
 │   │   ├── main.rs
 │   │   └── runtime/
 │   │       ├── config/
+│   │       │   ├── atomic.rs
+│   │       │   ├── instance_lock.rs
 │   │       │   ├── manager.rs
+│   │       │   ├── migration.rs
 │   │       │   ├── mod.rs
-│   │       │   └── schema.rs
+│   │       │   ├── recovery.rs
+│   │       │   ├── schema.rs
+│   │       │   └── validation.rs
 │   │       ├── error.rs
 │   │       ├── host.rs
+│   │       ├── integration_tests.rs
 │   │       ├── lifecycle.rs
 │   │       ├── mod.rs
 │   │       ├── permissions.rs
+│   │       ├── service.rs
 │   │       └── state.rs
 │   │
 │   ├── capabilities/
@@ -286,7 +285,7 @@ The structure will evolve as additional engines are implemented.
 
 * Node.js
 * npm
-* Rust toolchain
+* Rust toolchain, version 1.89 or newer.
 * Tauri 2 development prerequisites for your operating system.
 
 ### Installation
@@ -352,7 +351,7 @@ The Digital Universe is the foundation of that experience.
 ## 📌 Project Status
 
 **Development Stage:** Early Development
-**Current Phase:** Phase 2 — Runtime Infrastructure
+**Current Phase:** Phase 3 — Mirror Engine (specification stage; Phase 2 is complete)
 **Target Platform:** Windows first
 **Architecture Direction:** Cross-platform
 **Development Approach:** Modular, local-first, evidence-driven
